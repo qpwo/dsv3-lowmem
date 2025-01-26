@@ -135,7 +135,6 @@ def main(
         realprint(f"{stamp()} [gpu_{rank}]", *args, **kwargs)
     torch.cuda.set_device(local_rank)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_num_threads(32)
     torch.manual_seed(965)
     with open(config) as f:
         args = ModelArgs(**json.load(f))
@@ -158,11 +157,17 @@ def main(
 
     if interactive:
         messages = []
+        counter = -1
         while True:
+            counter += 1
+            def inpoot():
+                if counter == 0:
+                    return "WARM ME UP. TELL ME A LONG STORY. LET'S GET WARM."
+                return input(">>> ")
             if world_size == 1:
-                prompt = input(">>> ")
+                prompt = inpoot()
             elif rank == 0:
-                prompt = input(">>> ")
+                prompt = inpoot()
                 objects = [prompt]
                 dist.broadcast_object_list(objects, 0)
             else:
@@ -180,6 +185,8 @@ def main(
             completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
             print0('\n' + completion + '\n')
             messages.append({"role": "assistant", "content": completion})
+
+            messages.clear() # comment me to enable history
     else:
         with open(input_file) as f:
             prompts = [line.strip() for line in f.readlines()]
@@ -203,7 +210,6 @@ def my_load_model(
 ):
     filename = str(filename)
     import safetensors.torch
-    torch.set_num_threads(32)
     total = torch.tensor(0., device='cpu')
     print(f"loading {filename}")
     sd = safetensors.torch.load_file(filename, device="cpu")
