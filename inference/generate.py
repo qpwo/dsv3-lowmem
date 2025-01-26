@@ -13,7 +13,7 @@ realprint = print
 
 print0 = realprint
 
-torch.set_num_threads(8)
+torch.set_num_threads(32)
 def sample(logits, temperature: float = 1.0):
     """
     Samples a token from the logits using temperature scaling.
@@ -73,10 +73,9 @@ def generate(
             next_token = logits.argmax(dim=-1)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
-        if tokenizer:
+        if tokenizer and rank == 0:
             string = tokenizer.decode(tokens[0, cur_pos:cur_pos+1].tolist(), skip_special_tokens=True)
-            if rank == 0:
-                realprint(string, flush=True, end='')
+            realprint(string, flush=True, end='')
         numdid += 1
 
         finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
@@ -84,7 +83,7 @@ def generate(
         if finished.all():
             break
     elapsed = time.time() - started_at
-    print(f"\nDid {numdid} tokens in {elapsed} seconds ({numdid / elapsed:.1f} tok/sec)\n")
+    print0(f"\nDid {numdid} tokens in {elapsed:.2f} seconds ({numdid / elapsed:.1f} tok/sec)\n")
     completion_tokens = []
     for i, toks in enumerate(tokens.tolist()):
         toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
@@ -136,7 +135,7 @@ def main(
         realprint(f"{stamp()} [gpu_{rank}]", *args, **kwargs)
     torch.cuda.set_device(local_rank)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_num_threads(8)
+    torch.set_num_threads(32)
     torch.manual_seed(965)
     with open(config) as f:
         args = ModelArgs(**json.load(f))
@@ -152,6 +151,7 @@ def main(
         if isinstance(module, Linear):
             module.weight.scale = module.scale
     print('firing up')
+    # time.sleep(3)
 
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
     tokenizer.decode(generate(model, [tokenizer.encode("DeepSeek")], 2, -1, 1.)[0])
@@ -203,7 +203,7 @@ def my_load_model(
 ):
     filename = str(filename)
     import safetensors.torch
-    torch.set_num_threads(8)
+    torch.set_num_threads(32)
     total = torch.tensor(0., device='cpu')
     print(f"loading {filename}")
     sd = safetensors.torch.load_file(filename, device="cpu")

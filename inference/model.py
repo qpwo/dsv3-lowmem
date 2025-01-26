@@ -1,3 +1,4 @@
+from collections import defaultdict
 import time
 import gc
 import math
@@ -637,17 +638,42 @@ class Expert(nn.Module):
 
 class MM:
     "The memory man!"
-    gpu_memory_limit = 70 * 1024 * 1024 * 1024 # in bytes
     # CPU->GPU is fast but GPU->CPU is slow, so we keep our old CPU saved around.
     # tensors['module_name']['param_name'] = (parameter, cpu_tensor)
     saved: dict[str, dict[str, tuple[nn.Parameter, Tensor]]] = {}
-    lru_order = []
-    num_mods_added = 0
-    num_mods_dropped = 0
-    last_print = 0.0
+    score: dict[str, float] = defaultdict(float) # lowest-score tensor is dropped first
+    # lru_order = []
+    last_print_at = 0.0
+    num_mods_added = 0 # since print
+    num_mods_dropped = 0 # since print
+
+    times_used: dict[str, int] = defaultdict(int) # for saving top-used experts to json
+
+    max_experts = -1 # filled in by get_max_experts
 
     @staticmethod
-    def move_to_gpu(module:  nn.Module, mod_name: str) -> nn.Module:
+    def get_max_experts():
+        if MM.max_experts > 0: return MM.max_experts
+        if not MM.saved: return 1
+
+        expert_bytes = 0
+        mod_name = list(MM.saved.keys())[0]
+        for (_, tensor) in MM.saved[mod_name].values():
+            expert_bytes += tensor.element_size() * tensor.nelement()
+        expert_mb = expert_bytes / (1024 * 1024)
+
+        starting_used_mb = 9_000
+        total_cap_mb = torch.cuda.mem_get_info(torch.cuda.current_device())[1] / (1024 * 1024)
+        min_free_mb = 2_000
+        MM.max_experts = int((total_cap_mb - min_free_mb - starting_used_mb) / expert_mb)
+        print(f"{total_cap_mb=} {expert_mb=} {min_free_mb=} {MM.max_experts=}")
+        return MM.max_experts
+
+
+    @staticmethod
+    def move_to_gpu(module:  nn.Module, mod_name: str):
+        MM.times_used[mod_name] += 1
+        MM.score[mod_name] += 1
         if mod_name not in MM.saved:
             MM.num_mods_added += 1
             MM.saved[mod_name] = {}
@@ -656,40 +682,22 @@ class MM:
                 assert cpu_tensor.is_cpu
                 param.data = param.data.to('cuda')
                 MM.saved[mod_name][param_name] = (param, cpu_tensor)
-            MM.lru_order.append(mod_name)
-        else:
-            # for param_name, param in module.named_parameters():
-            #     param.data = MM.saved[mod_name][param_name]
-            MM.lru_order.remove(mod_name)
-            MM.lru_order.append(mod_name)
-        return module
-
-    @staticmethod
-    def get_used_memory_bytes():
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        return torch.cuda.memory_allocated()
 
     @staticmethod
     def clean_up_memory():
-        while MM.lru_order and MM.get_used_memory_bytes() > MM.gpu_memory_limit:
-            for _ in range(10): # Drop 10 modules at a time
-                if not MM.lru_order:
-                    break
-                MM.num_mods_dropped += 1
-                mod_name = MM.lru_order.pop(0)
-                # if 'cache' not in mod_name:  # Keep KV cache saved on GPU
-                # for param in MM.saved[mod_name].values():
-                for param_name in list(MM.saved[mod_name].keys()):
-                    param, cpu_tensor = MM.saved[mod_name].pop(param_name)
-                    # param.to('cpu')
-                    param.data = cpu_tensor
-                    del param
-                del MM.saved[mod_name]
-        if time.time() - MM.last_print > 5.0:
-            MM.last_print = time.time()
-            print(f'{MM.num_mods_dropped=} {MM.num_mods_added=}')
+        for k in MM.score:
+            MM.score[k] *= 0.9
+        while len(MM.saved) > MM.get_max_experts():
+            MM.num_mods_dropped += 1
+            mod_name = min(MM.saved.keys(), key=lambda k: MM.score[k])
+            for param_name in list(MM.saved[mod_name].keys()):
+                param, cpu_tensor = MM.saved[mod_name].pop(param_name)
+                param.data = cpu_tensor
+                del param
+            del MM.saved[mod_name]
+        if time.time() - MM.last_print_at > 8.0:
+            MM.last_print_at = time.time()
+            print(f'{len(MM.saved)=} {MM.num_mods_dropped=} {MM.num_mods_added=}')
             MM.num_mods_added = 0
             MM.num_mods_dropped = 0
 
