@@ -181,15 +181,15 @@ class Linear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype, device=meta))
         if self.weight.element_size() == 1:
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
-            self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
+            self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32, device=meta))
         else:
             self.register_parameter("scale", None)
         if bias:
-            self.bias = nn.Parameter(torch.empty(self.part_out_features))
+            self.bias = nn.Parameter(torch.empty(self.part_out_features, device=meta))
         else:
             self.register_parameter("bias", None)
 
@@ -479,7 +479,7 @@ class MLA(nn.Module):
             self.v_cache[:bsz, start_pos:end_pos] = v
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
-            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
+            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
@@ -636,7 +636,7 @@ class Expert(nn.Module):
 
 class MM:
     "The memory man!"
-    gpu_memory_limit = 90 * 1024 * 1024 * 1024 # in bytes
+    gpu_memory_limit = 75 * 1024 * 1024 * 1024 # in bytes
     # CPU->GPU is fast but GPU->CPU is slow, so we keep our old CPU saved around.
     # tensors['module_name']['param_name'] = (parameter, cpu_tensor)
     saved: dict[str, dict[str, tuple[nn.Parameter, Tensor]]] = {}
@@ -718,7 +718,7 @@ class MoE(nn.Module):
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(args)
-        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim, i) if self.experts_start_idx <= i < self.experts_end_idx else None
+        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
                                       for i in range(self.n_routed_experts)])
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
 

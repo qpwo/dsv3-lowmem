@@ -187,7 +187,7 @@ import torch.multiprocessing
 
 def my_load_model(
     model: torch.nn.Module, filename: Union[str, os.PathLike]
-): 
+):
     filename = str(filename)
     import safetensors.torch
     torch.set_num_threads(8)
