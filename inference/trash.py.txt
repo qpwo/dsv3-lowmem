@@ -1,0 +1,79 @@
+
+import torch.multiprocessing
+
+def my_load_model(
+    model: torch.nn.Module, filename: Union[str, os.PathLike]
+): # -> Tuple[List[str], List[str]]:
+    """
+    Loads a given filename onto a torch model.
+    This method exists specifically to avoid tensor sharing issues which are
+    not allowed in `safetensors`. [More information on tensor sharing](../torch_shared_tensors)
+
+    Args:
+        model (`torch.nn.Module`):
+            The model to load onto.
+        filename (`str`, or `os.PathLike`):
+            The filename location to load the file from.
+        strict (`bool`, *optional*, defaults to True):
+            Whether to fail if you're missing keys or having unexpected ones.
+            When false, the function simply returns missing and unexpected names.
+        device (`Union[str, int]`, *optional*, defaults to `cpu`):
+            The device where the tensors need to be located after load.
+            available options are all regular torch device locations.
+
+    Returns:
+        `(missing, unexpected): (List[str], List[str])`
+            `missing` are names in the model which were not modified during loading
+            `unexpected` are names that are on the file, but weren't used during
+            the load.
+    """
+    filename = str(filename)
+    import safetensors.torch
+    # model_state_dict = model.state_dict()
+    # to_removes = _remove_duplicate_names(model_state_dict, preferred_names=state_dict.keys())
+    num_chunks = 16
+
+    just_save = False
+    if just_save:
+        print(f"forcing cpu and just saving")
+        state_dict = safetensors.torch.load_file(filename, device="cpu")
+        print(f'{list(state_dict.keys())=}')
+        all_keys = list(state_dict.keys())
+        chunk_size = 1 + len(all_keys)  // num_chunks
+        for i in range(num_chunks):
+            keys = all_keys[i*chunk_size:(i+1)*chunk_size]
+            print(f"chunk={i}: {keys=}")
+            fn = filename.replace('.safetensors', f'_{i:02}.safetensors')
+            print(f"chunk={i}: {fn=} saving")
+            safetensors.torch.save_file({k: state_dict[k] for k in keys}, fn)
+            print(f"chunk={i}: {fn=} saved")
+        print(f"saved all chunks")
+        import sys
+        sys.exit(0)
+
+    torch.set_num_threads(8)
+    names = [filename.replace('.safetensors', f'_{i:02}.safetensors') for i in range(num_chunks)]
+
+
+    total = torch.tensor(0., device='cpu')
+    for name in names:
+        print(f"loading {name}")
+        sd = safetensors.torch.load_file(name, device='cpu')
+        for k in list(sd.keys()):
+            if '.experts.' not in k:
+                sd[k] = sd[k].to('cuda')
+            total += sd[k].view(-1)[0].float().cpu() # force it to actually load
+        model.load_state_dict(sd, strict=False, assign=True)
+
+    # import load_one
+    # import multiprocessing
+    # multiprocessing.set_start_method('spawn', force=True)
+    # torch.multiprocessing.set_start_method('spawn', force=True)
+
+    # num_workers = 3
+    # # num_workers = num_chunks
+    # with torch.multiprocessing.Pool(processes=num_workers) as pool:
+    #     # results = pool.map(load_one.load_one, [(name, device) for name in names])
+    #     for name, sd in  pool.map(load_one.load_one, names):
+    #         print(f"applying {name}")
+    #         model.load_state_dict(sd, strict=False, assign=True)

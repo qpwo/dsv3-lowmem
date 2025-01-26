@@ -1,16 +1,19 @@
 import os
 import json
 from argparse import ArgumentParser
-from typing import List
+from typing import List, Union
 
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
-from safetensors.torch import load_model
 
-from model import Transformer, ModelArgs
+from model import Linear, Transformer, ModelArgs
 
+realprint = print
 
+print0 = realprint
+
+torch.set_num_threads(8)
 def sample(logits, temperature: float = 1.0):
     """
     Samples a token from the logits using temperature scaling.
@@ -78,6 +81,14 @@ def generate(
     return completion_tokens
 
 
+from datetime import datetime
+import pytz
+
+pacific_tz = pytz.timezone('America/Los_Angeles')
+def stamp():
+    t = datetime.now(pacific_tz)
+    return t.strftime("%I:%M:%S %p")
+
 def main(
     ckpt_path: str,
     config: str,
@@ -103,8 +114,13 @@ def main(
     if world_size > 1:
         dist.init_process_group("nccl")
     global print
-    if rank != 0:
-        print = lambda *_, **__: None
+    def print(*args, **kwargs):
+        realprint(f"{stamp()} [gpu_{rank}]", *args, **kwargs)
+    global print0
+    def print0(*args, **kwargs):
+        if rank != 0:
+            return
+        realprint(f"{stamp()} [gpu_{rank}]", *args, **kwargs)
     torch.cuda.set_device(local_rank)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(8)
@@ -112,11 +128,20 @@ def main(
     with open(config) as f:
         args = ModelArgs(**json.load(f))
     print(args)
+    print('making model')
     with torch.device("cuda"):
         model = Transformer(args)
+    print('loading model')
+    weight_path = os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors")
+    my_load_model(model, weight_path)
+    print('fixing weight.scale')
+    for module in model.modules():  # modules() iterates through all descendants including self
+        if isinstance(module, Linear):
+            module.weight.scale = module.scale
+    print('firing up')
+
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
     tokenizer.decode(generate(model, [tokenizer.encode("DeepSeek")], 2, -1, 1.)[0])
-    load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
 
     if interactive:
         messages = []
@@ -140,7 +165,7 @@ def main(
             prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
             completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
             completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
-            print(completion)
+            print0(completion)
             messages.append({"role": "assistant", "content": completion})
     else:
         with open(input_file) as f:
@@ -150,13 +175,30 @@ def main(
         completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature)
         completions = tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
         for prompt, completion in zip(prompts, completions):
-            print("Prompt:", prompt)
-            print("Completion:", completion)
-            print()
+            print0("Prompt:", prompt)
+            print0("Completion:", completion)
+            print0()
 
     if world_size > 1:
         dist.destroy_process_group()
 
+
+import torch.multiprocessing
+
+def my_load_model(
+    model: torch.nn.Module, filename: Union[str, os.PathLike]
+): 
+    filename = str(filename)
+    import safetensors.torch
+    torch.set_num_threads(8)
+    total = torch.tensor(0., device='cpu')
+    print(f"loading {filename}")
+    sd = safetensors.torch.load_file(filename, device="cpu")
+    for k in list(sd.keys()):
+        if '.experts.' not in k:
+            sd[k] = sd[k].to('cuda')
+        total += sd[k].view(-1)[0].float().cpu() # force it to actually load
+    model.load_state_dict(sd, strict=False, assign=True)
 
 if __name__ == "__main__":
     """

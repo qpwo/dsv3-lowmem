@@ -1,14 +1,16 @@
+import gc
 import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
 from kernel import act_quant, weight_dequant, fp8_gemm
 
+meta = 'meta' # for toggle convenience
 
 world_size = 1
 rank = 0
@@ -51,8 +53,10 @@ class ModelArgs:
         beta_slow (int): Slow beta correction factor.
         mscale (float): Scaling factor for extended attention.
     """
-    max_batch_size: int = 8
-    max_seq_len: int = 4096 * 4
+    # max_batch_size: int = 8
+    max_batch_size: int = 1
+    # max_seq_len: int = 4096 * 4
+    max_seq_len: int = 2000
     dtype: Literal["bf16", "fp8"] = "bf16"
     vocab_size: int = 102400
     dim: int = 2048
@@ -100,7 +104,7 @@ class ParallelEmbedding(nn.Module):
         self.part_vocab_size = (vocab_size // world_size)
         self.vocab_start_idx = rank * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
-        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
+        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, device=meta))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -134,16 +138,16 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
 
     Args:
         x (torch.Tensor): The input tensor.
-        weight (torch.Tensor): The weight tensor. It may be quantized and 
+        weight (torch.Tensor): The weight tensor. It may be quantized and
             requires dequantization for certain cases.
         bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
 
     Returns:
-        torch.Tensor: The result of the linear transformation, which may involve 
+        torch.Tensor: The result of the linear transformation, which may involve
         quantization-aware computations depending on the input parameters.
 
     Notes:
-        - If `weight` is quantized (e.g., `element_size() > 1`), a dequantized version 
+        - If `weight` is quantized (e.g., `element_size() > 1`), a dequantized version
           is used for computation.
         - If `gemm_impl == "bf16"`, dequantization and a `bf16` GEMM operation are applied.
         - For other cases, the function applies quantization to `x` and uses `fp8_gemm` for computation.
@@ -276,7 +280,7 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim, device=meta))
 
     def forward(self, x: torch.Tensor):
         """
@@ -557,8 +561,8 @@ class Gate(nn.Module):
         self.topk_groups = args.n_limited_groups
         self.score_func = args.score_func
         self.route_scale = args.route_scale
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
-        self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
+        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim, device=meta))
+        self.bias = nn.Parameter(torch.empty(args.n_routed_experts, device=meta)) if self.dim == 7168 else None
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -630,6 +634,60 @@ class Expert(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
+class MM:
+    "The memory man!"
+    gpu_memory_limit = 90 * 1024 * 1024 * 1024 # in bytes
+    # CPU->GPU is fast but GPU->CPU is slow, so we keep our old CPU saved around.
+    # tensors['module_name']['param_name'] = (parameter, cpu_tensor)
+    saved: dict[str, dict[str, tuple[nn.Parameter, Tensor]]] = {}
+    lru_order = []
+    mods_added_since_last_gc = 0
+
+    @staticmethod
+    def move_to_gpu(module:  nn.Module, mod_name: str) -> nn.Module:
+        if mod_name not in MM.saved:
+            MM.mods_added_since_last_gc += 1
+            MM.saved[mod_name] = {}
+            for param_name, param in module.named_parameters():
+                cpu_tensor = param.data
+                assert cpu_tensor.is_cpu
+                param.data = param.data.to('cuda')
+                MM.saved[mod_name][param_name] = (param, cpu_tensor)
+            MM.lru_order.append(mod_name)
+        else:
+            # for param_name, param in module.named_parameters():
+            #     param.data = MM.saved[mod_name][param_name]
+            MM.lru_order.remove(mod_name)
+            MM.lru_order.append(mod_name)
+        return module
+
+    @staticmethod
+    def get_used_memory_bytes():
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        return torch.cuda.memory_allocated()
+
+    @staticmethod
+    def clean_up_memory():
+        num_mods_dropped = 0
+        while MM.lru_order and MM.get_used_memory_bytes() > MM.gpu_memory_limit:
+            for _ in range(10): # Drop 10 modules at a time
+                if not MM.lru_order:
+                    break
+                num_mods_dropped += 1
+                mod_name = MM.lru_order.pop(0)
+                # if 'cache' not in mod_name:  # Keep KV cache saved on GPU
+                # for param in MM.saved[mod_name].values():
+                for param_name in list(MM.saved[mod_name].keys()):
+                    param, cpu_tensor = MM.saved[mod_name].pop(param_name)
+                    # param.to('cpu')
+                    param.data = cpu_tensor
+                    del param
+                del MM.saved[mod_name]
+        print(f'{num_mods_dropped=} {MM.mods_added_since_last_gc=}')
+        MM.mods_added_since_last_gc = 0
+
 class MoE(nn.Module):
     """
     Mixture-of-Experts (MoE) module.
@@ -643,7 +701,7 @@ class MoE(nn.Module):
         experts (nn.ModuleList): List of expert modules.
         shared_experts (nn.Module): Shared experts applied to all inputs.
     """
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, layer_id: int):
         """
         Initializes the MoE module.
 
@@ -651,6 +709,7 @@ class MoE(nn.Module):
             args (ModelArgs): Model arguments containing MoE parameters.
         """
         super().__init__()
+        self.layer_id = layer_id
         self.dim = args.dim
         assert args.n_routed_experts % world_size == 0
         self.n_routed_experts = args.n_routed_experts
@@ -659,7 +718,7 @@ class MoE(nn.Module):
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(args)
-        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
+        self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim, i) if self.experts_start_idx <= i < self.experts_end_idx else None
                                       for i in range(self.n_routed_experts)])
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
 
@@ -679,6 +738,9 @@ class MoE(nn.Module):
         y = torch.zeros_like(x)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for i in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[i] != 0:
+                MM.move_to_gpu(self.experts[i], f"{self.layer_id}_expert_{i}")
+        for i in range(self.experts_start_idx, self.experts_end_idx):
             if counts[i] == 0:
                 continue
             expert = self.experts[i]
@@ -688,7 +750,6 @@ class MoE(nn.Module):
         if world_size > 1:
             dist.all_reduce(y)
         return (y + z).view(shape)
-
 
 class Block(nn.Module):
     """
@@ -709,8 +770,9 @@ class Block(nn.Module):
             args (ModelArgs): Model arguments containing block parameters.
         """
         super().__init__()
+        self.layer_id = layer_id
         self.attn = MLA(args)
-        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
+        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args, layer_id)
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
 
@@ -777,6 +839,7 @@ class Transformer(nn.Module):
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
+        MM.clean_up_memory()
         seqlen = tokens.size(1)
         h = self.embed(tokens)
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
