@@ -64,6 +64,10 @@ def generate(
     prompt_mask = tokens != -1
 
     started_at = time.time()
+    def print_rate():
+        elapsed = time.time() - started_at
+        print0(f"\nDid {numdid} tokens in {elapsed:.2f} seconds ({numdid / elapsed:.1f} tok/sec)\n")
+
     numdid = 0
     for cur_pos in range(min(prompt_lens), total_len):
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
@@ -73,17 +77,21 @@ def generate(
             next_token = logits.argmax(dim=-1)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
-        if tokenizer and rank == 0:
-            string = tokenizer.decode(tokens[0, cur_pos:cur_pos+1].tolist(), skip_special_tokens=True)
-            realprint(string, flush=True, end='')
+        # if tokenizer and rank == 0:
+        #     string = tokenizer.decode(tokens[0, cur_pos:cur_pos+1].tolist(), skip_special_tokens=True)
+        #     realprint(string, flush=True, end='')
+        if rank == 0:
+            realprint('.', flush=True, end='')
+            if numdid % 10 == 0:
+                print_rate()
+
         numdid += 1
 
         finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
         prev_pos = cur_pos
         if finished.all():
             break
-    elapsed = time.time() - started_at
-    print0(f"\nDid {numdid} tokens in {elapsed:.2f} seconds ({numdid / elapsed:.1f} tok/sec)\n")
+    print_rate()
     completion_tokens = []
     for i, toks in enumerate(tokens.tolist()):
         toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
@@ -161,7 +169,8 @@ def main(
         while True:
             counter += 1
             def inpoot():
-                if counter == 0:
+                # if counter == 0:
+                if counter < 2:
                     return "WARM ME UP. TELL ME A LONG STORY. LET'S GET WARM."
                 return input(">>> ")
             if world_size == 1:

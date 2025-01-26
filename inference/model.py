@@ -1,4 +1,5 @@
 from collections import defaultdict
+import random
 import time
 import gc
 import math
@@ -11,6 +12,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from kernel import act_quant, weight_dequant, fp8_gemm
+import my_util
 
 meta = 'meta' # for toggle convenience
 
@@ -71,6 +73,7 @@ class ModelArgs:
     n_routed_experts: int = 64
     n_shared_experts: int = 2
     n_activated_experts: int = 6
+    # n_activated_experts: int = 4
     n_expert_groups: int = 1
     n_limited_groups: int = 1
     score_func: Literal["softmax", "sigmoid"] = "softmax"
@@ -593,7 +596,8 @@ class Gate(nn.Module):
             indices = group_scores.topk(self.topk_groups, dim=-1)[1]
             mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
             scores = (scores * mask.unsqueeze(-1)).flatten(1)
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
+        # indices = torch.topk(scores, self.topk, dim=-1)[1]
+        indices = my_util.top_k_uniq(scores, self.topk, max_uniq=6)[1]
         weights = original_scores.gather(1, indices)
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
@@ -664,7 +668,7 @@ class MM:
 
         starting_used_mb = 9_000
         total_cap_mb = torch.cuda.mem_get_info(torch.cuda.current_device())[1] / (1024 * 1024)
-        min_free_mb = 2_000
+        min_free_mb = 3_000
         MM.max_experts = int((total_cap_mb - min_free_mb - starting_used_mb) / expert_mb)
         print(f"{total_cap_mb=} {expert_mb=} {min_free_mb=} {MM.max_experts=}")
         return MM.max_experts
