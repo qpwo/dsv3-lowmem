@@ -26,3 +26,5 @@ Or batch inference on a given file:
 ```shell
 OMP_NUM_THREADS=64 torchrun --nnodes 1 --nproc-per-node 8 generate.py --ckpt-path ~/dsv3-mp8 --config configs/config_671B.json --input-file $FILE
 ```
+
+If you want to sacrifice some quality for performance you can turn `n_activated_experts` and `n_expert_groups` down to 4 in `config_671B.json`. But if you really want to trade quality for performance, use a 4-bit quantization.
