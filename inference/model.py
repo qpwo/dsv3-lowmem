@@ -1,3 +1,4 @@
+import time
 import gc
 import math
 from dataclasses import dataclass
@@ -636,17 +637,19 @@ class Expert(nn.Module):
 
 class MM:
     "The memory man!"
-    gpu_memory_limit = 75 * 1024 * 1024 * 1024 # in bytes
+    gpu_memory_limit = 70 * 1024 * 1024 * 1024 # in bytes
     # CPU->GPU is fast but GPU->CPU is slow, so we keep our old CPU saved around.
     # tensors['module_name']['param_name'] = (parameter, cpu_tensor)
     saved: dict[str, dict[str, tuple[nn.Parameter, Tensor]]] = {}
     lru_order = []
-    mods_added_since_last_gc = 0
+    num_mods_added = 0
+    num_mods_dropped = 0
+    last_print = 0.0
 
     @staticmethod
     def move_to_gpu(module:  nn.Module, mod_name: str) -> nn.Module:
         if mod_name not in MM.saved:
-            MM.mods_added_since_last_gc += 1
+            MM.num_mods_added += 1
             MM.saved[mod_name] = {}
             for param_name, param in module.named_parameters():
                 cpu_tensor = param.data
@@ -670,12 +673,11 @@ class MM:
 
     @staticmethod
     def clean_up_memory():
-        num_mods_dropped = 0
         while MM.lru_order and MM.get_used_memory_bytes() > MM.gpu_memory_limit:
             for _ in range(10): # Drop 10 modules at a time
                 if not MM.lru_order:
                     break
-                num_mods_dropped += 1
+                MM.num_mods_dropped += 1
                 mod_name = MM.lru_order.pop(0)
                 # if 'cache' not in mod_name:  # Keep KV cache saved on GPU
                 # for param in MM.saved[mod_name].values():
@@ -685,8 +687,11 @@ class MM:
                     param.data = cpu_tensor
                     del param
                 del MM.saved[mod_name]
-        print(f'{num_mods_dropped=} {MM.mods_added_since_last_gc=}')
-        MM.mods_added_since_last_gc = 0
+        if time.time() - MM.last_print > 5.0:
+            MM.last_print = time.time()
+            print(f'{MM.num_mods_dropped=} {MM.num_mods_added=}')
+            MM.num_mods_added = 0
+            MM.num_mods_dropped = 0
 
 class MoE(nn.Module):
     """

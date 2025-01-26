@@ -8,7 +8,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from model import Linear, Transformer, ModelArgs
-
+import time
 realprint = print
 
 print0 = realprint
@@ -29,6 +29,7 @@ def sample(logits, temperature: float = 1.0):
     probs = torch.softmax(logits, dim=-1)
     return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
 
+rank = int(os.getenv("RANK", "0"))
 
 @torch.inference_mode()
 def generate(
@@ -36,7 +37,8 @@ def generate(
     prompt_tokens: List[List[int]],
     max_new_tokens: int,
     eos_id: int,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    tokenizer = None
 ) -> List[List[int]]:
     """
     Generates new tokens based on the given prompt tokens using the specified model.
@@ -60,6 +62,9 @@ def generate(
     prev_pos = 0
     finished = torch.tensor([False] * len(prompt_tokens), device="cuda")
     prompt_mask = tokens != -1
+
+    started_at = time.time()
+    numdid = 0
     for cur_pos in range(min(prompt_lens), total_len):
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
         if temperature > 0:
@@ -68,10 +73,18 @@ def generate(
             next_token = logits.argmax(dim=-1)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
+        if tokenizer:
+            string = tokenizer.decode(tokens[0, cur_pos:cur_pos+1].tolist(), skip_special_tokens=True)
+            if rank == 0:
+                realprint(string, flush=True, end='')
+        numdid += 1
+
         finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
         prev_pos = cur_pos
         if finished.all():
             break
+    elapsed = time.time() - started_at
+    print(f"\nDid {numdid} tokens in {elapsed} seconds ({numdid / elapsed:.1f} tok/sec)\n")
     completion_tokens = []
     for i, toks in enumerate(tokens.tolist()):
         toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
@@ -163,9 +176,9 @@ def main(
                 continue
             messages.append({"role": "user", "content": prompt})
             prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-            completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
+            completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature, tokenizer=tokenizer)
             completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
-            print0(completion)
+            print0('\n' + completion + '\n')
             messages.append({"role": "assistant", "content": completion})
     else:
         with open(input_file) as f:

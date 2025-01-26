@@ -1,5 +1,18 @@
 Run deepseek v3 on a 8xh100 node! Or 6 gh200s.
 
+Set gpu_memory_limit in model.py. I use 70GB for H100 or 85GB for GHG200.
+
+```
+pip install hf_transfer 'huggingface_hub[hf_transfer]'
+HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download --local-dir ~/dsv3 deepseek-ai/DeepSeek-V3
+
+git clone https://github.com/qpwo/dsv3-lowmem
+cd dsv3-lowmem/inference
+pip install -r requirements.txt
+python convert.py --hf-ckpt-path ~/dsv3 --save-path ~/dsv3-mp8 --n-experts 256 --model-parallel 8
+OMP_NUM_THREADS=32 torchrun --nnodes 1 --nproc-per-node 8 generate.py --ckpt-path ~/dsv3-mp8 --config configs/config_671B.json --interactive --temperature 0.7 --max-new-tokens 200
+```
+
 ### 6.1 Inference with DeepSeek-Infer Demo (example only)
 
 #### System Requirements
@@ -33,7 +46,7 @@ Download the model weights from Hugging Face, and put them into `/path/to/DeepSe
 Convert Hugging Face model weights to a specific format:
 
 ```shell
-python convert.py --hf-ckpt-path /path/to/DeepSeek-V3 --save-path /path/to/DeepSeek-V3-Demo --n-experts 256 --model-parallel 16
+python convert.py --hf-ckpt-path ~/hff/deepseek-v3-instruct/ --save-path ~/hff/deepseek-v3-instruct-mp8 --n-experts 256 --model-parallel 8
 ```
 
 #### Run
@@ -41,7 +54,7 @@ python convert.py --hf-ckpt-path /path/to/DeepSeek-V3 --save-path /path/to/DeepS
 Then you can chat with DeepSeek-V3:
 
 ```shell
-torchrun --nnodes 1 --nproc-per-node 8 generate.py --ckpt-path /path/to/DeepSeek-V3-Demo --config configs/config_671B.json --interactive --temperature 0.7 --max-new-tokens 200
+torchrun --nnodes 1 --nproc-per-node 8 generate.py --ckpt-path ~/hff/deepseek-v3-instruct-mp8 --config configs/config_671B.json --interactive --temperature 0.7 --max-new-tokens 200
 ```
 
 Or batch inference on a given file:
